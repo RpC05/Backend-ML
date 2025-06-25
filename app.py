@@ -12,6 +12,7 @@ from sklearn.model_selection import train_test_split
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error
 from datetime import datetime, timedelta, timezone
+from supabase import create_client, Client
 
 # --- 1. CONFIGURACIÓN DE LA APP Y SUPABASE ---
 load_dotenv()
