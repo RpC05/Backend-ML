@@ -38,31 +38,37 @@ MAE_THRESHOLD = 5
 MONITORING_WINDOW_DAYS = 7
 MIN_SAMPLES_FOR_RETRAIN = 5
 
-def load_models_from_storage():
-    global X_columns, models
-    print("Iniciando carga de modelos desde Supabase Storage...")
+def load_initial_config():
+    global X_columns
+    print("Iniciando carga de configuración inicial (solo columnas)...")
     try:
-        # Cargar columnas de entrenamiento
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
         X_columns = joblib.load(io.BytesIO(file_bytes))
-        print("Columnas de entrenamiento cargadas.")
-
-        # Cargar modelo para cada plato
-        for plato in platos:
-            model_file_name = f'modelo_{plato.replace(" ", "_")}.pkl'
-            try:
-                file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
-                models[plato] = joblib.load(io.BytesIO(file_bytes))
-                print(f"Modelo cargado para {plato}")
-            except Exception as e:
-                # Maneja el caso en que un modelo no exista en el bucket
-                print(f"Advertencia: No se encontró modelo para {plato} en el bucket. Error: {e}")
-                models[plato] = None
+        print("Columnas de entrenamiento cargadas. Los modelos se cargarán bajo demanda.")
     except Exception as e:
-        print(f"ERROR CRÍTICO: No se pudieron cargar los modelos iniciales. {e}")
+        print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
+
+def get_model(plato_name):
+    global models
+    if plato_name in models:
+        return models[plato_name]
+
+    print(f"Modelo para '{plato_name}' no en caché. Descargando...")
+    model_file_name = f'modelo_{plato_name.replace(" ", "_")}.pkl'
+    try:
+        file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
+        model = joblib.load(io.BytesIO(file_bytes))
+        models[plato_name] = model
+        print(f"Modelo para '{plato_name}' cargado y cacheado.")
+        return model
+
+    except Exception as e:
+        print(f"Advertencia: No se pudo cargar el modelo para {plato_name}. Error: {e}")
+        models[plato_name] = None
+        return None
 
 # Cargar los modelos una sola vez al iniciar la aplicación
-load_models_from_storage()
+load_initial_config()
 
 # Endpoint de salud para verificar que la app está viva
 @app.route('/', methods=['GET'])
@@ -77,14 +83,20 @@ def predict():
         prediction_group_id = str(uuid.uuid4())
         input_data_df = pd.DataFrame([data])
         processed_input = pd.get_dummies(input_data_df, columns=['nombre_dia', 'clima'])
+        if X_columns is None:
+            return jsonify({'error': 'La configuración del modelo no está lista, intente de nuevo.'}), 503
+
         missing_cols = set(X_columns) - set(processed_input.columns)
         for col in missing_cols:
             processed_input[col] = 0
+        
         processed_input = processed_input[X_columns]
         predictions_response = {}
         supabase_records = []
         total_platos = 0
-        for plato, model in models.items():
+        
+        for plato in platos:
+            model = get_model(plato)
             if model is None:
                 predicted_quantity = 0
             else:
@@ -97,6 +109,7 @@ def predict():
                 'input_data': data,
                 'predicted_quantity': int(predicted_quantity)
             })
+
         supabase.table('dish_predictions').insert(supabase_records).execute()
         predictions_response['total_platos'] = int(total_platos)
         predictions_response['prediction_group_id'] = prediction_group_id
@@ -210,7 +223,7 @@ def retrain_and_upload_models(df):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         # Cargar modelo antiguo desde la memoria para comparar
-        old_model = models.get(plato)
+        old_model = get_model(plato)
         if old_model:
             old_mae = mean_absolute_error(y_test, old_model.predict(X_test))
             print(f"MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
