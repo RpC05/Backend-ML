@@ -43,8 +43,22 @@ def load_initial_config():
     print("Iniciando carga de configuración inicial (solo columnas)...")
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
-        X_columns = joblib.load(io.BytesIO(file_bytes))
-        print("Columnas de entrenamiento cargadas. Los modelos se cargarán bajo demanda.")
+        X_columns = joblib.load(io.BytesIO(file_bytes)) 
+        print("Columnas de entrenamiento cargadas.")
+
+        # Cargar modelo para cada plato
+        for plato in platos:
+            model_file_name = f'modelo_{plato.replace(" ", "_")}.pkl'
+            try:
+                file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
+                loaded_model = joblib.load(io.BytesIO(file_bytes))
+                loaded_model.set_params(tree_method='hist', device='cpu')
+                models[plato] = joblib.load(io.BytesIO(file_bytes))
+                print(f"Modelo cargado para {plato}")
+            except Exception as e:
+                # Maneja el caso en que un modelo no exista en el bucket
+                print(f"Advertencia: No se encontró modelo para {plato} en el bucket. Error: {e}")
+                models[plato] = None 
     except Exception as e:
         print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
 
@@ -166,8 +180,7 @@ def trigger_retrain_request(base_url):
 # --- 5. LÓGICA Y ENDPOINT DEL PIPELINE DE REENTRENAMIENTO ---
 
 def send_alert(message):
-    # En Vercel, las alertas se verán en los logs de la función
-    print("🚨 ALERTA 🚨")
+    print("ALERTA")
     print(message)
 
 def monitor_performance(df):
@@ -232,8 +245,6 @@ def retrain_and_upload_models(df):
             print(f"No se encontró modelo antiguo en memoria para '{plato}'.")
 
         # Reentrenar el nuevo modelo
-        # NOTA: Los hiperparámetros de XGBRegressor estaban como (...)
-        # Los he puesto con valores razonables. Ajústalos si es necesario.
         new_model = XGBRegressor(colsample_bytree=0.8, learning_rate=0.05, max_depth=4, n_estimators=100, subsample=0.8)
         new_model.fit(X_train, y_train)
         new_mae = mean_absolute_error(y_test, new_model.predict(X_test))
