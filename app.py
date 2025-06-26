@@ -44,21 +44,7 @@ def load_initial_config():
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
         X_columns = joblib.load(io.BytesIO(file_bytes)) 
-        print("Columnas de entrenamiento cargadas.")
-
-        # Cargar modelo para cada plato
-        for plato in platos:
-            model_file_name = f'modelo_{plato.replace(" ", "_")}.pkl'
-            try:
-                file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
-                loaded_model = joblib.load(io.BytesIO(file_bytes))
-                loaded_model.set_params(tree_method='hist', device='cpu')
-                models[plato] = loaded_model
-                print(f"Modelo cargado para {plato}")
-            except Exception as e:
-                # Maneja el caso en que un modelo no exista en el bucket
-                print(f"Advertencia: No se encontró modelo para {plato} en el bucket. Error: {e}")
-                models[plato] = None 
+        print("Columnas de entrenamiento cargadas.") 
     except Exception as e:
         print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
 
@@ -72,6 +58,7 @@ def get_model(plato_name):
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
         model = joblib.load(io.BytesIO(file_bytes))
+        model.set_params(tree_method='hist', device='cpu')
         models[plato_name] = model
         print(f"Modelo para '{plato_name}' cargado y cacheado.")
         return model
