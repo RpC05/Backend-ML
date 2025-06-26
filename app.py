@@ -30,7 +30,7 @@ print("Cliente de Supabase inicializado.")
 BUCKET_NAME = "modelos"
 X_columns = None
 models = {}
-platos = ['Aji de Gallina', 'Arroz Chaufa', 'Arroz con Chancho', 'Caldo de Gallina', 'Causa de Ceviche',
+platos = ['Aji de Gallina', 'Arroz Chaufa', 'Arroz con Chancho', 'Caldo de Gallina',
           'Causa de Pollo', 'Ceviche', 'Chicharron de Pescado', 'Chicharron de Pollo', 'Churrasco',
           'Cuy Guisado', 'Gallo Guisado', 'Lomo Saltado', 'Pescado Frito', 'Pollo Guisado', 'Rocoto Relleno',
           'Seco de Cordero', 'Sudado de Pescado', 'Tacu Tacu', 'Tallarines Verdes con Chuleta']
@@ -290,6 +290,9 @@ def trigger_retrain():
         
         df = pd.DataFrame(response.data)
         input_df = pd.json_normalize(df['input_data'])
+        # Si 'created_at' existe en los datos del JSON, la eliminamos para evitar duplicados
+        if 'created_at' in input_df.columns:
+            input_df = input_df.drop('created_at', axis=1)
         all_data = pd.concat([input_df.reset_index(drop=True), df[['dish_name', 'predicted_quantity', 'observed_quantity', 'created_at']].reset_index(drop=True)], axis=1)
         print(f"Se descargaron {len(all_data)} registros con feedback.")
         
