@@ -39,7 +39,7 @@ MONITORING_WINDOW_DAYS = 7
 MIN_SAMPLES_FOR_RETRAIN = 5
 
 def load_initial_config():
-    global X_columns
+    global X_columns, models
     print("Iniciando carga de configuración inicial (solo columnas)...")
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
@@ -53,7 +53,7 @@ def load_initial_config():
                 file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
                 loaded_model = joblib.load(io.BytesIO(file_bytes))
                 loaded_model.set_params(tree_method='hist', device='cpu')
-                models[plato] = joblib.load(io.BytesIO(file_bytes))
+                models[plato] = loaded_model
                 print(f"Modelo cargado para {plato}")
             except Exception as e:
                 # Maneja el caso en que un modelo no exista en el bucket
