@@ -6,7 +6,6 @@ import uuid
 import os
 import io
 import threading
-import requests
 from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 from xgboost import XGBRegressor
@@ -28,7 +27,7 @@ print("Cliente de Supabase inicializado.")
 
 # Variables globales y constantes
 BUCKET_NAME = "modelos"
-X_columns = None
+X_columns = None # Se inicializa como None, se cargará como DataFrame
 models = {}
 platos = ['Aji de Gallina', 'Arroz Chaufa', 'Arroz con Chancho', 'Caldo de Gallina',
           'Causa de Pollo', 'Ceviche', 'Chicharron de Pescado', 'Chicharron de Pollo', 'Churrasco',
@@ -39,12 +38,31 @@ MONITORING_WINDOW_DAYS = 7
 MIN_SAMPLES_FOR_RETRAIN = 5
 
 def load_initial_config():
-    global X_columns, models
+    """
+    Carga las columnas y las estandariza a un DataFrame para evitar errores.
+    Esta es la corrección clave para el fallo silencioso.
+    """
+    global X_columns
     print("Iniciando carga de configuración inicial (solo columnas)...")
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
-        X_columns = joblib.load(io.BytesIO(file_bytes)) 
-        print("Columnas de entrenamiento cargadas.") 
+        loaded_object = joblib.load(io.BytesIO(file_bytes))
+        
+        # --- COMIENZO DE LA CORRECCIÓN CRÍTICA ---
+        # Estandarizamos el objeto cargado a un DataFrame vacío con esas columnas.
+        # Esto garantiza que X_columns.columns siempre funcione, sin importar
+        # si el pickle contenía un DataFrame, un Index o una lista.
+        if isinstance(loaded_object, pd.DataFrame):
+            column_names = loaded_object.columns
+        elif isinstance(loaded_object, pd.Index):
+            column_names = loaded_object
+        else: # Asumimos que es una lista o similar
+            column_names = list(loaded_object)
+            
+        X_columns = pd.DataFrame(columns=column_names)
+        # --- FIN DE LA CORRECCIÓN CRÍTICA ---
+
+        print(f"Columnas de entrenamiento cargadas y estandarizadas con {len(X_columns.columns)} columnas.") 
     except Exception as e:
         print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
         X_columns = None
@@ -59,41 +77,38 @@ def get_model(plato_name):
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download(model_file_name)
         model = joblib.load(io.BytesIO(file_bytes))
-        model.set_params(tree_method='hist', device='cpu')
         models[plato_name] = model
         print(f"Modelo para '{plato_name}' cargado y cacheado.")
         return model
-
     except Exception as e:
         print(f"Advertencia: No se pudo cargar el modelo para {plato_name}. Error: {e}")
         models[plato_name] = None
         return None
 
-# Cargar los modelos una sola vez al iniciar la aplicación
 load_initial_config()
 
-# Endpoint de salud para verificar que la app está viva
 @app.route('/', methods=['GET'])
 def health_check():
     return "Backend para Predicciones Doña Bere está activo."
 
-# --- 3. ENDPOINT DE PREDICCIÓN CON REGISTRO EN SUPABASE ---
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
         data = request.get_json()
         if X_columns is None:
-            return jsonify({'error': 'La configuración del modelo no está lista, intente de nuevo.'}), 503
+            return jsonify({'error': 'La configuración del modelo no está lista. Intente de nuevo más tarde.'}), 503
 
         prediction_group_id = str(uuid.uuid4())
         input_data_df = pd.DataFrame([data])
         processed_input = pd.get_dummies(input_data_df, columns=['nombre_dia', 'clima'])
-
-        missing_cols = set(X_columns) - set(processed_input.columns)
-        for col in missing_cols:
-            processed_input[col] = 0
         
-        processed_input = processed_input[X_columns]
+        # Alinear con las columnas de entrenamiento
+        final_input = X_columns.copy()
+        for col in final_input.columns:
+            if col in processed_input.columns:
+                final_input[col] = processed_input[col]
+        final_input = final_input.fillna(0)
+        
         predictions_response = {}
         supabase_records = []
         total_platos = 0
@@ -103,10 +118,11 @@ def predict():
             predicted_quantity = 0
             if model:
                 try:
-                    predicted_quantity = max(0, round(model.predict(processed_input)[0]))
+                    # Usamos .iloc[0] para asegurar que pasamos una sola fila
+                    predicted_quantity = max(0, round(model.predict(final_input)[0]))
                 except Exception as e:
                     print(f"Error prediciendo para {plato}: {e}")
-
+            
             predictions_response[plato] = int(predicted_quantity)
             total_platos += predicted_quantity
             supabase_records.append({
@@ -124,7 +140,35 @@ def predict():
         print(f"Error en /predict: {e}")
         return jsonify({'error': str(e)}), 500
 
-# --- 4. ENDPOINT DE FEEDBACK ---
+def run_full_retraining_pipeline():
+    with app.app_context():
+        print("\n--- INICIANDO PIPELINE DE REENTRENAMIENTO (Ejecución directa en hilo) ---")
+        try:
+            response = supabase.table('dish_predictions').select('*').not_.is_('observed_quantity', 'NULL').execute()
+            if not response.data:
+                print("PIPELINE: No hay datos con feedback para reentrenar. Finalizando.")
+                return
+
+            df = pd.DataFrame(response.data)
+            input_df = pd.json_normalize(df['input_data'])
+            
+            if 'created_at' in input_df.columns:
+                input_df = input_df.drop('created_at', axis=1)
+                
+            all_data = pd.concat([input_df.reset_index(drop=True), df[['dish_name', 'predicted_quantity', 'observed_quantity', 'created_at']].reset_index(drop=True)], axis=1)
+            print(f"PIPELINE: Se descargaron {len(all_data)} registros con feedback.")
+            
+            platos_a_reentrenar = monitor_performance(all_data)
+            if not platos_a_reentrenar:
+                print("PIPELINE: Ningún modelo supera el umbral de MAE. No se necesita reentrenamiento.")
+            else:
+                retrain_and_upload_models(all_data, platos_a_reentrenar)
+            
+            print("\n--- PIPELINE DE REENTRENAMIENTO FINALIZADO CON ÉXITO ---")
+        except Exception as e:
+            # Este log es vital si algo más falla dentro del hilo
+            print(f"ERROR CATASTRÓFICO DURANTE EL PIPELINE DE REENTRENAMIENTO: {e}")
+
 @app.route('/feedback', methods=['POST'])
 def feedback():
     try:
@@ -133,8 +177,8 @@ def feedback():
         observed_sales = feedback_data.get('observed_sales')
         if not prediction_group_id or not observed_sales:
             return jsonify({'error': 'Faltan prediction_group_id u observed_sales'}), 400
-        response = supabase.table('dish_predictions').select('id, predicted_quantity, dish_name').eq('prediction_group_id', prediction_group_id).execute()
         
+        response = supabase.table('dish_predictions').select('id, predicted_quantity, dish_name').eq('prediction_group_id', prediction_group_id).execute()
         if not response.data:
             return jsonify({'error': 'prediction_group_id no encontrado'}), 404
         
@@ -148,116 +192,92 @@ def feedback():
                 'absolute_error': absolute_error
             }).eq('id', record['id']).execute()
 
-        base_url = request.url_root 
-        # Llama al endpoint de reentrenamiento en un hilo separado para no esperar
-        retrain_thread = threading.Thread(target=trigger_retrain_request, args=(base_url,))
+        retrain_thread = threading.Thread(target=run_full_retraining_pipeline)
         retrain_thread.start()
 
-        print(f"Feedback procesado. Disparando reentrenamiento en segundo plano.")
-        return jsonify({'message': 'Feedback procesado con éxito. El reentrenamiento ha comenzado.'}), 200
+        print("Feedback procesado. Disparando reentrenamiento directamente en segundo plano.")
+        return jsonify({'message': 'Feedback procesado con éxito. El reentrenamiento se ha iniciado en segundo plano.'}), 200
     
     except Exception as e:
         print(f"Error en /feedback: {e}")
         return jsonify({'error': str(e)}), 500
 
-def trigger_retrain_request(base_url):
-    try:
-        requests.post(f"{base_url}trigger-retrain", timeout=3)
-        print("Petición a /trigger-retrain enviada.")
-    except requests.exceptions.ReadTimeout:
-        print("La petición a /trigger-retrain ha expirado (comportamiento esperado).")
-    except Exception as e:
-        print(f"Error al disparar el reentrenamiento: {e}")
-
-# --- 5. LÓGICA Y ENDPOINT DEL PIPELINE DE REENTRENAMIENTO ---
 def send_alert(message):
-    print("ALERTA")
-    print(message)
+    print(f"ALERTA: {message}")
 
 def monitor_performance(df):
-    """Monitorea el error (MAE) por plato en los datos recibidos."""
     print("\n--- Iniciando Monitoreo de Rendimiento ---")
     df['created_at'] = pd.to_datetime(df['created_at'])
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=MONITORING_WINDOW_DAYS)
     recent_data = df[df['created_at'] >= cutoff_date]
 
     if recent_data.empty:
-        print("No hay datos recientes para monitorear.")
-        return
+        print("MONITOR: No hay datos recientes para monitorear.")
+        return []
 
     platos_malos = []
     try:
         mae_by_dish = recent_data.groupby('dish_name').apply(
             lambda x: mean_absolute_error(x['observed_quantity'], x['predicted_quantity'])
-        )
-        print("Error Absoluto Medio (MAE) por plato en la última semana:")
+        ).sort_values(ascending=False)
+        print("MONITOR: Error Absoluto Medio (MAE) por plato en la última semana:")
         print(mae_by_dish)
         for dish, mae in mae_by_dish.items():
             if mae > MAE_THRESHOLD:
                 send_alert(f"El MAE para '{dish}' es {mae:.2f}, superando el umbral de {MAE_THRESHOLD}.")
                 platos_malos.append(dish)
     except Exception as e:
-        print(f"Error durante el monitoreo: {e}")
+        print(f"MONITOR: Error durante el monitoreo de rendimiento: {e}")
 
     return platos_malos
 
-
 def retrain_and_upload_models(df, platos_a_reentrenar):
-    """Reentrena, sube y recarga en memoria los modelos mejorados."""
-    global X_columns, models # Indicar que modificaremos las variables globales
+    global X_columns, models
     print("\n--- Iniciando Pipeline de Reentrenamiento y Subida ---") 
 
     for plato in platos_a_reentrenar:
-        print(f"\nProcesando plato: {plato}")
+        print(f"\nRE-TRAIN: Procesando plato: {plato}")
         plato_data = df[df['dish_name'] == plato].copy()
-
-        # Agrupar por día para tener una muestra por día y evitar sesgos
-        daily_samples = plato_data.groupby(plato_data['created_at'].dt.date).first().reset_index()
+        daily_samples = plato_data.groupby(plato_data['created_at'].dt.date).first().reset_index(drop=True)
 
         if len(daily_samples) < MIN_SAMPLES_FOR_RETRAIN:
-            print(f"Datos insuficientes ({len(daily_samples)}) para reentrenar '{plato}'. Se necesitan {MIN_SAMPLES_FOR_RETRAIN}.")
+            print(f"RE-TRAIN: Datos insuficientes ({len(daily_samples)}) para reentrenar '{plato}'. Se necesitan {MIN_SAMPLES_FOR_RETRAIN}.")
             continue
         
-        # --- Lógica de preparación de datos (AHORA DENTRO DE LA FUNCIÓN) ---
         y = daily_samples['observed_quantity']
+        
+        # Usamos X_columns.columns que ahora es seguro gracias a la estandarización inicial
         features_df = daily_samples[list(X_columns.columns)].copy()
-        X_dummies = pd.get_dummies(daily_samples, columns=['nombre_dia', 'clima'])
-
-        X = pd.DataFrame(columns=X_columns.columns)
-        for col in X_columns.columns:
+        X_dummies = pd.get_dummies(features_df, columns=['nombre_dia', 'clima'])
+        
+        X = X_columns.copy()
+        for col in X.columns:
             if col in X_dummies.columns:
                 X[col] = X_dummies[col]
-            else:
-                X[col] = 0
         X = X.fillna(0).astype(int)
-        X = X[X_columns.columns]
-
+        
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # Cargar modelo antiguo desde la memoria para comparar
         old_model = get_model(plato)
         old_mae = float('inf')
         if old_model:
             try:
                 old_mae = mean_absolute_error(y_test, old_model.predict(X_test))
-                print(f"MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
+                print(f"RE-TRAIN: MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
             except Exception as e:
-                print(f"No se pudo evaluar el modelo antiguo para '{plato}'. Asumiendo MAE infinito. Error: {e}")
-        else: 
-            print(f"No se encontró modelo antiguo en memoria para '{plato}'.")
+                print(f"RE-TRAIN: No se pudo evaluar el modelo antiguo para '{plato}'. Asumiendo MAE infinito. Error: {e}")
+        else:
+            print(f"RE-TRAIN: No se encontró modelo antiguo en memoria para '{plato}'.")
 
-        # Reentrenar el nuevo modelo
         new_model = XGBRegressor(colsample_bytree=0.8, learning_rate=0.05, max_depth=4, n_estimators=100, subsample=0.8)
         new_model.fit(X_train, y_train)
         new_mae = mean_absolute_error(y_test, new_model.predict(X_test))
-        print(f"MAE del modelo nuevo para '{plato}': {new_mae:.2f}")
+        print(f"RE-TRAIN: MAE del modelo nuevo para '{plato}': {new_mae:.2f}")
 
-        # Subir el modelo nuevo solo si es mejor
         if new_mae < old_mae:
-            print(f"El nuevo modelo para '{plato}' es mejor. Subiendo y actualizando...")
+            print(f"RE-TRAIN: El nuevo modelo para '{plato}' es mejor. Subiendo y actualizando...")
             model_file_name = f'modelo_{plato.replace(" ", "_")}.pkl'
             
-            # Guardar el modelo en un buffer de memoria para subirlo
             model_buffer = io.BytesIO()
             joblib.dump(new_model, model_buffer)
             model_buffer.seek(0)
@@ -268,48 +288,13 @@ def retrain_and_upload_models(df, platos_a_reentrenar):
                     path=model_file_name,
                     file_options={'cache-control': '3600', 'upsert': 'true'}
                 )
-                print(f"Modelo '{model_file_name}' actualizado en Supabase Storage.")
-                
-                # --- PASO CRÍTICO: Actualizar el modelo en la memoria de la app ---
+                print(f"RE-TRAIN: Modelo '{model_file_name}' actualizado en Supabase Storage.")
                 models[plato] = new_model
-                print(f"Modelo para '{plato}' actualizado en memoria.")
-
+                print(f"RE-TRAIN: Modelo para '{plato}' actualizado en memoria.")
             except Exception as e:
-                print(f"Error al subir el modelo a Supabase Storage: {e}")
+                print(f"RE-TRAIN: Error al subir el modelo a Supabase Storage: {e}")
         else:
-            print(f"El modelo antiguo para '{plato}' es mejor o igual. No se actualiza.")
+            print(f"RE-TRAIN: El modelo antiguo para '{plato}' es mejor o igual. No se actualiza.")
 
-
-@app.route('/trigger-retrain', methods=['POST'])
-def trigger_retrain(): 
-    print("\n--- INICIANDO PIPELINE DE REENTRENAMIENTO (disparado por webhook) ---")
-    try:
-        # 1. Obtener todos los datos con feedback de Supabase
-        response = supabase.table('dish_predictions').select('*').not_.is_('observed_quantity', 'NULL').execute()
-        if not response.data:
-            print("No hay datos con feedback para reentrenar.")
-            return jsonify({'message': 'No hay datos nuevos'}), 200
-        
-        df = pd.DataFrame(response.data)
-        input_df = pd.json_normalize(df['input_data'])
-        # Si 'created_at' existe en los datos del JSON, la eliminamos para evitar duplicados
-        if 'created_at' in input_df.columns:
-            input_df = input_df.drop('created_at', axis=1)
-        all_data = pd.concat([input_df.reset_index(drop=True), df[['dish_name', 'predicted_quantity', 'observed_quantity', 'created_at']].reset_index(drop=True)], axis=1)
-        print(f"Se descargaron {len(all_data)} registros con feedback.")
-        
-        # 2. Ejecutar el monitoreo y el reentrenamiento
-        platos_a_reentrenar = monitor_performance(all_data)
-        if not platos_a_reentrenar:
-            print("Ningún modelo supera el umbral de MAE. No se necesita reentrenamiento.")
-        else:
-            retrain_and_upload_models(all_data, platos_a_reentrenar)
-        
-        print("\n--- PIPELINE DE REENTRENAMIENTO FINALIZADO ---")
-        return jsonify({'message': 'Reentrenamiento completado'}), 200
-    except Exception as e:
-        print(f"ERROR DURANTE EL REENTRENAMIENTO: {e}")
-        return jsonify({'error': str(e)}), 500
-    
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
