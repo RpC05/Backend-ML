@@ -181,6 +181,7 @@ def monitor_performance(df):
         print("No hay datos recientes para monitorear.")
         return
 
+    platos_malos = []
     try:
         mae_by_dish = recent_data.groupby('dish_name').apply(
             lambda x: mean_absolute_error(x['observed_quantity'], x['predicted_quantity'])
@@ -190,16 +191,17 @@ def monitor_performance(df):
         for dish, mae in mae_by_dish.items():
             if mae > MAE_THRESHOLD:
                 send_alert(f"El MAE para '{dish}' es {mae:.2f}, superando el umbral de {MAE_THRESHOLD}.")
+                platos_malos.append(dish)
     except Exception as e:
         print(f"Error durante el monitoreo: {e}")
 
+    return platos_malos
 
-def retrain_and_upload_models(df):
+
+def retrain_and_upload_models(df, platos_a_reentrenar):
     """Reentrena, sube y recarga en memoria los modelos mejorados."""
     global X_columns, models # Indicar que modificaremos las variables globales
-    print("\n--- Iniciando Pipeline de Reentrenamiento y Subida ---")
-
-    platos_a_reentrenar = df['dish_name'].unique()
+    print("\n--- Iniciando Pipeline de Reentrenamiento y Subida ---") 
 
     for plato in platos_a_reentrenar:
         print(f"\nProcesando plato: {plato}")
@@ -284,8 +286,11 @@ def trigger_retrain():
         print(f"Se descargaron {len(all_data)} registros con feedback.")
         
         # 2. Ejecutar el monitoreo y el reentrenamiento
-        monitor_performance(all_data)
-        retrain_and_upload_models(all_data)
+        platos_a_reentrenar = monitor_performance(all_data)
+        if not platos_a_reentrenar:
+            print("Ningún modelo supera el umbral de MAE. No se necesita reentrenamiento.")
+        else:
+            retrain_and_upload_models(all_data)
         
         print("\n--- PIPELINE DE REENTRENAMIENTO FINALIZADO ---")
         return jsonify({'message': 'Reentrenamiento completado'}), 200
