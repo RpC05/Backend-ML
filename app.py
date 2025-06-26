@@ -47,6 +47,7 @@ def load_initial_config():
         print("Columnas de entrenamiento cargadas.") 
     except Exception as e:
         print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
+        X_columns = None
 
 def get_model(plato_name):
     global models
@@ -81,11 +82,12 @@ def health_check():
 def predict():
     try:
         data = request.get_json()
+        if X_columns is None:
+            return jsonify({'error': 'La configuración del modelo no está lista, intente de nuevo.'}), 503
+
         prediction_group_id = str(uuid.uuid4())
         input_data_df = pd.DataFrame([data])
         processed_input = pd.get_dummies(input_data_df, columns=['nombre_dia', 'clima'])
-        if X_columns is None:
-            return jsonify({'error': 'La configuración del modelo no está lista, intente de nuevo.'}), 503
 
         missing_cols = set(X_columns) - set(processed_input.columns)
         for col in missing_cols:
@@ -98,10 +100,13 @@ def predict():
         
         for plato in platos:
             model = get_model(plato)
-            if model is None:
-                predicted_quantity = 0
-            else:
-                predicted_quantity = max(0, round(model.predict(processed_input)[0]))
+            predicted_quantity = 0
+            if model:
+                try:
+                    predicted_quantity = max(0, round(model.predict(processed_input)[0]))
+                except Exception as e:
+                    print(f"Error prediciendo para {plato}: {e}")
+
             predictions_response[plato] = int(predicted_quantity)
             total_platos += predicted_quantity
             supabase_records.append({
@@ -129,8 +134,10 @@ def feedback():
         if not prediction_group_id or not observed_sales:
             return jsonify({'error': 'Faltan prediction_group_id u observed_sales'}), 400
         response = supabase.table('dish_predictions').select('id, predicted_quantity, dish_name').eq('prediction_group_id', prediction_group_id).execute()
+        
         if not response.data:
             return jsonify({'error': 'prediction_group_id no encontrado'}), 404
+        
         for record in response.data:
             dish_name = record['dish_name']
             observed_quantity = observed_sales.get(dish_name, 0)
@@ -162,10 +169,7 @@ def trigger_retrain_request(base_url):
     except Exception as e:
         print(f"Error al disparar el reentrenamiento: {e}")
 
-
-
 # --- 5. LÓGICA Y ENDPOINT DEL PIPELINE DE REENTRENAMIENTO ---
-
 def send_alert(message):
     print("ALERTA")
     print(message)
@@ -216,21 +220,30 @@ def retrain_and_upload_models(df, platos_a_reentrenar):
         
         # --- Lógica de preparación de datos (AHORA DENTRO DE LA FUNCIÓN) ---
         y = daily_samples['observed_quantity']
-        X = pd.get_dummies(daily_samples, columns=['nombre_dia', 'clima'])
-        missing_cols = set(X_columns) - set(X.columns)
-        for col in missing_cols:
-            X[col] = 0
-        X = X[X_columns]
+        features_df = daily_samples[list(X_columns.columns)].copy()
+        X_dummies = pd.get_dummies(daily_samples, columns=['nombre_dia', 'clima'])
+
+        X = pd.DataFrame(columns=X_columns.columns)
+        for col in X_columns.columns:
+            if col in X_dummies.columns:
+                X[col] = X_dummies[col]
+            else:
+                X[col] = 0
+        X = X.fillna(0).astype(int)
+        X = X[X_columns.columns]
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         # Cargar modelo antiguo desde la memoria para comparar
         old_model = get_model(plato)
+        old_mae = float('inf')
         if old_model:
-            old_mae = mean_absolute_error(y_test, old_model.predict(X_test))
-            print(f"MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
-        else:
-            old_mae = float('inf')
+            try:
+                old_mae = mean_absolute_error(y_test, old_model.predict(X_test))
+                print(f"MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
+            except Exception as e:
+                print(f"No se pudo evaluar el modelo antiguo para '{plato}'. Asumiendo MAE infinito. Error: {e}")
+        else: 
             print(f"No se encontró modelo antiguo en memoria para '{plato}'.")
 
         # Reentrenar el nuevo modelo
@@ -290,10 +303,13 @@ def trigger_retrain():
         if not platos_a_reentrenar:
             print("Ningún modelo supera el umbral de MAE. No se necesita reentrenamiento.")
         else:
-            retrain_and_upload_models(all_data)
+            retrain_and_upload_models(all_data, platos_a_reentrenar)
         
         print("\n--- PIPELINE DE REENTRENAMIENTO FINALIZADO ---")
         return jsonify({'message': 'Reentrenamiento completado'}), 200
     except Exception as e:
         print(f"ERROR DURANTE EL REENTRENAMIENTO: {e}")
         return jsonify({'error': str(e)}), 500
+    
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
