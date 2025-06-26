@@ -27,7 +27,7 @@ print("Cliente de Supabase inicializado.")
 
 # Variables globales y constantes
 BUCKET_NAME = "modelos"
-X_columns = None # Se inicializa como None, se cargará como DataFrame
+X_columns_template = None # DataFrame plantilla para asegurar la estructura
 models = {}
 platos = ['Aji de Gallina', 'Arroz Chaufa', 'Arroz con Chancho', 'Caldo de Gallina',
           'Causa de Pollo', 'Ceviche', 'Chicharron de Pescado', 'Chicharron de Pollo', 'Churrasco',
@@ -38,34 +38,24 @@ MONITORING_WINDOW_DAYS = 7
 MIN_SAMPLES_FOR_RETRAIN = 5
 
 def load_initial_config():
-    """
-    Carga las columnas y las estandariza a un DataFrame para evitar errores.
-    Esta es la corrección clave para el fallo silencioso.
-    """
-    global X_columns
+    global X_columns_template
     print("Iniciando carga de configuración inicial (solo columnas)...")
     try:
         file_bytes = supabase.storage.from_(BUCKET_NAME).download("columnas_entrenamiento.pkl")
         loaded_object = joblib.load(io.BytesIO(file_bytes))
         
-        # --- COMIENZO DE LA CORRECCIÓN CRÍTICA ---
-        # Estandarizamos el objeto cargado a un DataFrame vacío con esas columnas.
-        # Esto garantiza que X_columns.columns siempre funcione, sin importar
-        # si el pickle contenía un DataFrame, un Index o una lista.
         if isinstance(loaded_object, pd.DataFrame):
             column_names = loaded_object.columns
         elif isinstance(loaded_object, pd.Index):
             column_names = loaded_object
-        else: # Asumimos que es una lista o similar
+        else:
             column_names = list(loaded_object)
             
-        X_columns = pd.DataFrame(columns=column_names)
-        # --- FIN DE LA CORRECCIÓN CRÍTICA ---
-
-        print(f"Columnas de entrenamiento cargadas y estandarizadas con {len(X_columns.columns)} columnas.") 
+        X_columns_template = pd.DataFrame(columns=column_names)
+        print(f"Columnas de entrenamiento cargadas y estandarizadas con {len(X_columns_template.columns)} columnas.") 
     except Exception as e:
         print(f"ERROR CRÍTICO: No se pudieron cargar las columnas de entrenamiento. La app no puede funcionar. {e}")
-        X_columns = None
+        X_columns_template = None
 
 def get_model(plato_name):
     global models
@@ -87,6 +77,13 @@ def get_model(plato_name):
 
 load_initial_config()
 
+def _prepare_data_for_model(df):
+    """Función unificada para preparar datos para predicción o entrenamiento."""
+    processed_df = pd.get_dummies(df, columns=['nombre_dia', 'clima'])
+    # .reindex() es la forma correcta y rápida de alinear columnas
+    final_df = processed_df.reindex(columns=X_columns_template.columns, fill_value=0)
+    return final_df
+
 @app.route('/', methods=['GET'])
 def health_check():
     return "Backend para Predicciones Doña Bere está activo."
@@ -95,19 +92,12 @@ def health_check():
 def predict():
     try:
         data = request.get_json()
-        if X_columns is None:
+        if X_columns_template is None:
             return jsonify({'error': 'La configuración del modelo no está lista. Intente de nuevo más tarde.'}), 503
 
         prediction_group_id = str(uuid.uuid4())
         input_data_df = pd.DataFrame([data])
-        processed_input = pd.get_dummies(input_data_df, columns=['nombre_dia', 'clima'])
-        
-        # Alinear con las columnas de entrenamiento
-        final_input = X_columns.copy()
-        for col in final_input.columns:
-            if col in processed_input.columns:
-                final_input[col] = processed_input[col]
-        final_input = final_input.fillna(0)
+        final_input = _prepare_data_for_model(input_data_df)
         
         predictions_response = {}
         supabase_records = []
@@ -118,7 +108,6 @@ def predict():
             predicted_quantity = 0
             if model:
                 try:
-                    # Usamos .iloc[0] para asegurar que pasamos una sola fila
                     predicted_quantity = max(0, round(model.predict(final_input)[0]))
                 except Exception as e:
                     print(f"Error prediciendo para {plato}: {e}")
@@ -166,7 +155,6 @@ def run_full_retraining_pipeline():
             
             print("\n--- PIPELINE DE REENTRENAMIENTO FINALIZADO CON ÉXITO ---")
         except Exception as e:
-            # Este log es vital si algo más falla dentro del hilo
             print(f"ERROR CATASTRÓFICO DURANTE EL PIPELINE DE REENTRENAMIENTO: {e}")
 
 @app.route('/feedback', methods=['POST'])
@@ -228,11 +216,10 @@ def monitor_performance(df):
                 platos_malos.append(dish)
     except Exception as e:
         print(f"MONITOR: Error durante el monitoreo de rendimiento: {e}")
-
     return platos_malos
 
 def retrain_and_upload_models(df, platos_a_reentrenar):
-    global X_columns, models
+    global X_columns_template, models
     print("\n--- Iniciando Pipeline de Reentrenamiento y Subida ---") 
 
     for plato in platos_a_reentrenar:
@@ -244,18 +231,14 @@ def retrain_and_upload_models(df, platos_a_reentrenar):
             print(f"RE-TRAIN: Datos insuficientes ({len(daily_samples)}) para reentrenar '{plato}'. Se necesitan {MIN_SAMPLES_FOR_RETRAIN}.")
             continue
         
-        y = daily_samples['observed_quantity']
+        y = daily_samples['observed_quantity'].reset_index(drop=True)
         
-        # Usamos X_columns.columns que ahora es seguro gracias a la estandarización inicial
-        features_df = daily_samples[list(X_columns.columns)].copy()
-        X_dummies = pd.get_dummies(features_df, columns=['nombre_dia', 'clima'])
-        
-        X = X_columns.copy()
-        for col in X.columns:
-            if col in X_dummies.columns:
-                X[col] = X_dummies[col]
-        X = X.fillna(0).astype(int)
-        
+        # --- CORRECCIÓN FINAL Y DEFINITIVA DE LA LÓGICA ---
+        # Preparamos los datos de entrenamiento usando la misma función robusta que para predecir.
+        # Esto es rápido, correcto y elimina el error del bucle de reinicio.
+        X = _prepare_data_for_model(daily_samples)
+        # --- FIN DE LA CORRECCIÓN ---
+
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         old_model = get_model(plato)
@@ -265,9 +248,9 @@ def retrain_and_upload_models(df, platos_a_reentrenar):
                 old_mae = mean_absolute_error(y_test, old_model.predict(X_test))
                 print(f"RE-TRAIN: MAE del modelo antiguo para '{plato}': {old_mae:.2f}")
             except Exception as e:
-                print(f"RE-TRAIN: No se pudo evaluar el modelo antiguo para '{plato}'. Asumiendo MAE infinito. Error: {e}")
+                print(f"RE-TRAIN: No se pudo evaluar modelo antiguo: {e}")
         else:
-            print(f"RE-TRAIN: No se encontró modelo antiguo en memoria para '{plato}'.")
+            print(f"RE-TRAIN: No se encontró modelo antiguo en memoria.")
 
         new_model = XGBRegressor(colsample_bytree=0.8, learning_rate=0.05, max_depth=4, n_estimators=100, subsample=0.8)
         new_model.fit(X_train, y_train)
@@ -292,9 +275,9 @@ def retrain_and_upload_models(df, platos_a_reentrenar):
                 models[plato] = new_model
                 print(f"RE-TRAIN: Modelo para '{plato}' actualizado en memoria.")
             except Exception as e:
-                print(f"RE-TRAIN: Error al subir el modelo a Supabase Storage: {e}")
+                print(f"RE-TRAIN: Error al subir modelo a Supabase Storage: {e}")
         else:
-            print(f"RE-TRAIN: El modelo antiguo para '{plato}' es mejor o igual. No se actualiza.")
+            print(f"RE-TRAIN: El modelo antiguo es mejor o igual. No se actualiza.")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
